@@ -1,7 +1,7 @@
 const express = require('express');
 const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason } = require('@whiskeysockets/baileys');
 const admin = require('firebase-admin');
-const pino = pino = require('pino');
+const pino = require('pino');
 const dotenv = require('dotenv');
 const fs = require('fs');
 const path = require('path');
