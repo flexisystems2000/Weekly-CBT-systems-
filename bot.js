@@ -1188,7 +1188,7 @@ async function startWhatsApp(
                 logger,
 
                 browser:
-                    Browsers.ubuntu(
+                    Browsers.appropriate(
                         "Chrome"
                     ),
 
