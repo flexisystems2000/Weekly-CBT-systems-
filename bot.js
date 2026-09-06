@@ -6,7 +6,8 @@ const fs = require("fs");
 const path = require("path");
 const pino = require("pino");
 
-const admin = require("firebase-admin");
+const { initializeApp, cert } = require("firebase-admin/app");
+const { getFirestore, FieldPath, Timestamp } = require("firebase-admin/firestore");
 
 const {
     default: makeWASocket,
@@ -61,16 +62,12 @@ try {
     console.error(error.message);
     process.exit(1);
 }
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-    });
 
-const db = admin.firestore();
+initializeApp({
+    credential: cert(serviceAccount)
+});
 
-const {
-    FieldPath,
-    Timestamp
-} = admin.firestore;
+const db = getFirestore();
 
 /* =========================================================
    QUESTION BANK MAP
@@ -185,14 +182,6 @@ function normalizePhoneNumber(number) {
         phone = phone.substring(1);
     }
 
-    /*
-       Nigerian:
-
-       08012345678
-       ->
-       2348012345678
-    */
-
     if (
         phone.startsWith("0") &&
         phone.length === 11
@@ -201,12 +190,6 @@ function normalizePhoneNumber(number) {
             "234" +
             phone.substring(1);
     }
-
-    /*
-       Sometimes user enters:
-
-       234 801 234 5678
-    */
 
     return phone;
 }
@@ -290,11 +273,6 @@ async function registrationNumberExists(regNumber) {
         return true;
     }
 
-    /*
-       Also check candidate.regNumber
-       for compatibility with any older records.
-    */
-
     const legacySnapshot =
         await db
             .collection("cbt_submissions")
@@ -325,10 +303,6 @@ async function ensureRegistrationNumber(
     const current =
         submissionDoc.data();
 
-    /*
-       Existing top-level regNumber
-    */
-
     if (
         isValidRegistrationNumber(
             current.regNumber
@@ -337,10 +311,6 @@ async function ensureRegistrationNumber(
         return current.regNumber;
     }
 
-    /*
-       Existing nested regNumber
-    */
-
     if (
         isValidRegistrationNumber(
             current.candidate?.regNumber
@@ -348,10 +318,6 @@ async function ensureRegistrationNumber(
     ) {
         return current.candidate.regNumber;
     }
-
-    /*
-       Generate a new one.
-    */
 
     let newRegNumber;
 
@@ -376,13 +342,6 @@ async function ensureRegistrationNumber(
             "Unable to generate a unique registration number."
         );
     }
-
-    /*
-       Transaction prevents two simultaneous
-       result requests from generating two
-       different registration numbers for
-       the same submission.
-    */
 
     await db.runTransaction(
         async transaction => {
@@ -415,7 +374,7 @@ async function ensureRegistrationNumber(
                 {
                     regNumber: newRegNumber,
                     regNumberCreatedAt:
-                        admin.firestore.FieldValue.serverTimestamp()
+                        Timestamp.now()
                 }
             );
         }
@@ -497,11 +456,6 @@ function phoneVariants(phone) {
 
     variants.add(normalized);
 
-    /*
-       Nigerian international ->
-       local 0-prefixed
-    */
-
     if (
         normalized.startsWith("234") &&
         normalized.length === 13
@@ -532,12 +486,6 @@ async function findCandidateResult(
 
     const results = [];
 
-    /*
-       We query both possible stored formats.
-
-       Firestore "in" supports multiple values.
-    */
-
     const snapshot =
         await db
             .collection("cbt_submissions")
@@ -556,11 +504,6 @@ async function findCandidateResult(
         });
 
     });
-
-    /*
-       Fallback in case some old records use
-       a different structure.
-    */
 
     if (!results.length) {
 
@@ -592,10 +535,6 @@ async function findCandidateResult(
     if (!results.length) {
         return null;
     }
-
-    /*
-       Return latest submission.
-    */
 
     results.sort(
         (a, b) =>
@@ -647,11 +586,6 @@ async function fetchQuestionBank(
             `${subject} question bank is not an array.`
         );
     }
-
-    /*
-       exam.html uses the first 15 questions
-       from each selected subject.
-    */
 
     return data.slice(0, 15);
 }
@@ -740,22 +674,6 @@ async function calculateSubjectScores(
 
         let rawScore = 0;
 
-        /*
-           Global question indexes are:
-
-           Subject 0:
-           0 - 14
-
-           Subject 1:
-           15 - 29
-
-           Subject 2:
-           30 - 44
-
-           Subject 3:
-           45 - 59
-        */
-
         for (
             let localIndex = 0;
             localIndex < questions.length &&
@@ -772,11 +690,6 @@ async function calculateSubjectScores(
 
             let selected =
                 answers[globalIndex];
-
-            /*
-               Some stored answer objects may
-               use string keys.
-            */
 
             if (
                 selected === undefined ||
@@ -818,10 +731,6 @@ async function calculateSubjectScores(
             }
         }
 
-        /*
-           15 questions -> 100
-        */
-
         const scoreOutOf100 =
             Math.round(
                 (rawScore / 15) *
@@ -835,15 +744,6 @@ async function calculateSubjectScores(
             score: scoreOutOf100
         });
     }
-
-    /*
-       Aggregate is the sum of the
-       four subject scores.
-
-       Maximum:
-       100 + 100 + 100 + 100
-       = 400
-    */
 
     const aggregate =
         subjectScores.reduce(
@@ -905,18 +805,6 @@ function parseMockResultCommand(
         String(text)
             .trim();
 
-    /*
-       Accepted:
-
-       MOCKRESULT08012345678
-
-       MOCKRESULT 08012345678
-
-       MOCKRESULT:08012345678
-
-       MOCKRESULT 2348012345678
-    */
-
     const match =
         cleaned.match(
             /^MOCKRESULT\s*[:\-]?\s*(\+?\d{10,15})$/i
@@ -938,475 +826,117 @@ function parseMockResultCommand(
 const dashboardHTML = `
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
-
 <meta charset="UTF-8">
-
-<meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
->
-
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Flexi MockResult Bot</title>
-
 <style>
-
-* {
-    box-sizing: border-box;
-}
-
-body {
-    margin: 0;
-    font-family:
-        Arial,
-        Helvetica,
-        sans-serif;
-    background: #07110d;
-    color: #ffffff;
-}
-
-.container {
-    width: 100%;
-    max-width: 650px;
-    margin: auto;
-    padding: 20px;
-}
-
-.card {
-    background: #0d1d17;
-    border: 1px solid #1e3b2e;
-    border-radius: 18px;
-    padding: 22px;
-    margin-top: 20px;
-    box-shadow:
-        0 15px 40px
-        rgba(0,0,0,.35);
-}
-
-h1 {
-    margin-top: 0;
-    color: #5ee59a;
-}
-
-h2 {
-    margin-top: 0;
-}
-
-label {
-    display: block;
-    margin-bottom: 8px;
-    font-weight: bold;
-}
-
-input {
-    width: 100%;
-    padding: 15px;
-    border-radius: 10px;
-    border: 1px solid #315642;
-    background: #06100c;
-    color: white;
-    font-size: 16px;
-    outline: none;
-}
-
-input:focus {
-    border-color: #5ee59a;
-}
-
-button {
-    width: 100%;
-    padding: 15px;
-    margin-top: 15px;
-    border: none;
-    border-radius: 10px;
-    background: #159447;
-    color: white;
-    font-size: 16px;
-    font-weight: bold;
-    cursor: pointer;
-}
-
-button:hover {
-    background: #1aad55;
-}
-
-.status {
-    padding: 14px;
-    border-radius: 10px;
-    background: #06100c;
-    margin-top: 15px;
-}
-
-.code {
-    font-size: 32px;
-    text-align: center;
-    letter-spacing: 5px;
-    font-weight: bold;
-    color: #5ee59a;
-    padding: 20px;
-    background: #06100c;
-    border-radius: 12px;
-    margin-top: 15px;
-    word-break: break-all;
-}
-
-.small {
-    color: #9fb3a8;
-    font-size: 14px;
-    line-height: 1.5;
-}
-
-.hidden {
-    display: none;
-}
-
-.error {
-    color: #ff7777;
-}
-
-.success {
-    color: #5ee59a;
-}
-
-.warning {
-    color: #ffd166;
-}
-
+* { box-sizing: border-box; }
+body { margin: 0; font-family: Arial, Helvetica, sans-serif; background: #07110d; color: #ffffff; }
+.container { width: 100%; max-width: 650px; margin: auto; padding: 20px; }
+.card { background: #0d1d17; border: 1px solid #1e3b2e; border-radius: 18px; padding: 22px; margin-top: 20px; box-shadow: 0 15px 40px rgba(0,0,0,.35); }
+h1 { margin-top: 0; color: #5ee59a; }
+h2 { margin-top: 0; }
+label { display: block; margin-bottom: 8px; font-weight: bold; }
+input { width: 100%; padding: 15px; border-radius: 10px; border: 1px solid #315642; background: #06100c; color: white; font-size: 16px; outline: none; }
+input:focus { border-color: #5ee59a; }
+button { width: 100%; padding: 15px; margin-top: 15px; border: none; border-radius: 10px; background: #159447; color: white; font-size: 16px; font-weight: bold; cursor: pointer; }
+button:hover { background: #1aad55; }
+.status { padding: 14px; border-radius: 10px; background: #06100c; margin-top: 15px; }
+.code { font-size: 32px; text-align: center; letter-spacing: 5px; font-weight: bold; color: #5ee59a; padding: 20px; background: #06100c; border-radius: 12px; margin-top: 15px; word-break: break-all; }
+.small { color: #9fb3a8; font-size: 14px; line-height: 1.5; }
+.hidden { display: none; }
+.error { color: #ff7777; }
+.success { color: #5ee59a; }
+.warning { color: #ffd166; }
 </style>
-
 </head>
-
 <body>
-
 <div class="container">
-
 <div class="card">
-
 <h1>Flexi MockResult Bot</h1>
-
-<p class="small">
-Pair your WhatsApp number with the bot using
-WhatsApp's pairing-code system.
-</p>
-
-<label>
-Dashboard Password
-</label>
-
-<input
-    id="password"
-    type="password"
-    value=""
-    placeholder="Enter dashboard password"
->
-
-<label style="margin-top:15px;">
-WhatsApp Number
-</label>
-
-<input
-    id="phone"
-    type="tel"
-    placeholder="08012345678 or 2348012345678"
->
-
-<button onclick="pairBot()">
-GENERATE PAIRING CODE
-</button>
-
-<div
-    id="message"
-    class="status hidden"
-></div>
-
-<div
-    id="codeBox"
-    class="hidden"
->
-
+<p class="small">Pair your WhatsApp number with the bot using WhatsApp's pairing-code system.</p>
+<label>Dashboard Password</label>
+<input id="password" type="password" value="" placeholder="Enter dashboard password">
+<label style="margin-top:15px;">WhatsApp Number</label>
+<input id="phone" type="tel" placeholder="08012345678 or 2348012345678">
+<button onclick="pairBot()">GENERATE PAIRING CODE</button>
+<div id="message" class="status hidden"></div>
+<div id="codeBox" class="hidden">
 <h2>Pairing Code</h2>
-
-<div
-    id="pairingCode"
-    class="code"
-></div>
-
-<p class="small">
-Open WhatsApp on the phone you entered,
-go to Linked Devices → Link a Device →
-Link with phone number instead, then enter
-the code above.
-</p>
-
+<div id="pairingCode" class="code"></div>
+<p class="small">Open WhatsApp on the phone you entered, go to Linked Devices → Link a Device → Link with phone number instead, then enter the code above.</p>
 </div>
-
 </div>
-
 <div class="card">
-
 <h2>Bot Status</h2>
-
-<div class="status">
-<strong>Status:</strong>
-<span id="connection">
-Loading...
-</span>
+<div class="status"><strong>Status:</strong> <span id="connection">Loading...</span></div>
+<div class="status"><strong>Paired Number:</strong> <span id="botNumber">-</span></div>
+<div class="status"><strong>Pairing:</strong> <span id="pairingStatus">-</span></div>
 </div>
-
-<div class="status">
-<strong>Paired Number:</strong>
-<span id="botNumber">
--
-</span>
-</div>
-
-<div class="status">
-<strong>Pairing:</strong>
-<span id="pairingStatus">
--
-</span>
-</div>
-
-</div>
-
 <div class="card">
-
 <h2>Command</h2>
-
-<p class="small">
-Students can send:
-</p>
-
-<div class="status">
-MOCKRESULT08012345678
+<p class="small">Students can send:</p>
+<div class="status">MOCKRESULT08012345678</div>
+<p class="small">or</p>
+<div class="status">MOCKRESULT 08012345678</div>
 </div>
-
-<p class="small">
-or
-</p>
-
-<div class="status">
-MOCKRESULT 08012345678
 </div>
-
-</div>
-
-</div>
-
 <script>
-
 let password = "";
-
-function showMessage(
-    text,
-    type = ""
-) {
-
-    const box =
-        document.getElementById(
-            "message"
-        );
-
+function showMessage(text, type = "") {
+    const box = document.getElementById("message");
     box.textContent = text;
-
-    box.className =
-        "status " + type;
+    box.className = "status " + type;
 }
-
 async function pairBot() {
-
-    password =
-        document.getElementById(
-            "password"
-        ).value;
-
-    const phone =
-        document.getElementById(
-            "phone"
-        ).value.trim();
-
-    if (!password) {
-        showMessage(
-            "Enter dashboard password.",
-            "error"
-        );
-        return;
-    }
-
-    if (!phone) {
-        showMessage(
-            "Enter the WhatsApp number.",
-            "error"
-        );
-        return;
-    }
-
-    showMessage(
-        "Requesting pairing code...",
-        "warning"
-    );
-
+    password = document.getElementById("password").value;
+    const phone = document.getElementById("phone").value.trim();
+    if (!password) { showMessage("Enter dashboard password.", "error"); return; }
+    if (!phone) { showMessage("Enter the WhatsApp number.", "error"); return; }
+    showMessage("Requesting pairing code...", "warning");
     try {
-
-        const response =
-            await fetch(
-                "/api/pair",
-                {
-                    method: "POST",
-                    headers: {
-                        "Content-Type":
-                            "application/json",
-                        "x-dashboard-password":
-                            password
-                    },
-                    body:
-                        JSON.stringify({
-                            phone
-                        })
-                }
-            );
-
-        const data =
-            await response.json();
-
-        if (!response.ok) {
-            throw new Error(
-                data.message ||
-                "Pairing failed."
-            );
-        }
-
+        const response = await fetch("/api/pair", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-dashboard-password": password },
+            body: JSON.stringify({ phone })
+        });
+        const data = await response.json();
+        if (!response.ok) { throw new Error(data.message || "Pairing failed."); }
         if (data.code) {
-
-            document
-                .getElementById(
-                    "pairingCode"
-                )
-                .textContent =
-                data.code;
-
-            document
-                .getElementById(
-                    "codeBox"
-                )
-                .classList
-                .remove("hidden");
+            document.getElementById("pairingCode").textContent = data.code;
+            document.getElementById("codeBox").classList.remove("hidden");
         }
-
-        showMessage(
-            data.message ||
-            "Pairing code generated.",
-            "success"
-        );
-
+        showMessage(data.message || "Pairing code generated.", "success");
         loadStatus();
-
     } catch (error) {
-
-        showMessage(
-            error.message,
-            "error"
-        );
+        showMessage(error.message, "error");
     }
 }
-
 async function loadStatus() {
-
-    if (!password) {
-        return;
-    }
-
+    if (!password) { return; }
     try {
-
-        const response =
-            await fetch(
-                "/api/status",
-                {
-                    headers: {
-                        "x-dashboard-password":
-                            password
-                    }
-                }
-            );
-
-        if (!response.ok) {
-            return;
-        }
-
-        const data =
-            await response.json();
-
-        document
-            .getElementById(
-                "connection"
-            )
-            .textContent =
-            data.connectionState;
-
-        document
-            .getElementById(
-                "botNumber"
-            )
-            .textContent =
-            data.phone || "-";
-
-        document
-            .getElementById(
-                "pairingStatus"
-            )
-            .textContent =
-            data.pairingInProgress
-                ? "In progress"
-                : "Not active";
-
+        const response = await fetch("/api/status", {
+            headers: { "x-dashboard-password": password }
+        });
+        if (!response.ok) { return; }
+        const data = await response.json();
+        document.getElementById("connection").textContent = data.connectionState;
+        document.getElementById("botNumber").textContent = data.phone || "-";
+        document.getElementById("pairingStatus").textContent = data.pairingInProgress ? "In progress" : "Not active";
         if (data.pairingCode) {
-
-            document
-                .getElementById(
-                    "pairingCode"
-                )
-                .textContent =
-                data.pairingCode;
-
-            document
-                .getElementById(
-                    "codeBox"
-                )
-                .classList
-                .remove("hidden");
+            document.getElementById("pairingCode").textContent = data.pairingCode;
+            document.getElementById("codeBox").classList.remove("hidden");
         }
-
-    } catch (error) {
-        console.error(error);
-    }
+    } catch (error) { console.error(error); }
 }
-
-document
-    .getElementById("password")
-    .addEventListener(
-        "change",
-        () => {
-            password =
-                document
-                    .getElementById(
-                        "password"
-                    )
-                    .value;
-
-            loadStatus();
-        }
-    );
-
-setInterval(
-    loadStatus,
-    5000
-);
-
+document.getElementById("password").addEventListener("change", () => {
+    password = document.getElementById("password").value;
+    loadStatus();
+});
+setInterval(loadStatus, 5000);
 </script>
-
 </body>
-
 </html>
 `;
 
@@ -1415,9 +945,7 @@ setInterval(
 ========================================================= */
 
 app.get("/", (req, res) => {
-
     res.send(dashboardHTML);
-
 });
 
 /* =========================================================
@@ -1428,7 +956,6 @@ app.get(
     "/api/status",
     dashboardAuth,
     (req, res) => {
-
         res.json({
             success: true,
             connectionState,
@@ -1441,7 +968,6 @@ app.get(
             pairingCode,
             lastConnectionUpdate
         });
-
     }
 );
 
@@ -1453,9 +979,7 @@ app.post(
     "/api/pair",
     dashboardAuth,
     async (req, res) => {
-
         try {
-
             let phone =
                 normalizePhoneNumber(
                     req.body.phone
@@ -1472,15 +996,6 @@ app.post(
                         "Enter a valid WhatsApp number."
                 });
             }
-
-            /*
-               For a new pairing, remove the
-               previous authentication state.
-
-               This means the number entered
-               in the dashboard becomes the
-               number being paired.
-            */
 
             if (
                 pairingInProgress
@@ -1499,26 +1014,15 @@ app.post(
 
             pairingCode = "";
 
-            /*
-               Start/restart WhatsApp socket.
-            */
-
             await startWhatsApp(
                 true
             );
-
-            /*
-               Give the socket a moment to
-               initialize before requesting
-               pairing code.
-            */
 
             let attempts = 0;
 
             while (
                 attempts < 30
             ) {
-
                 attempts++;
 
                 if (
@@ -1553,12 +1057,6 @@ app.post(
                 });
             }
 
-            /*
-               IMPORTANT:
-               Baileys pairing expects the
-               phone number without + or spaces.
-            */
-
             const code =
                 await sock.requestPairingCode(
                     phone
@@ -1576,7 +1074,6 @@ app.post(
             });
 
         } catch (error) {
-
             pairingInProgress =
                 false;
 
@@ -1602,7 +1099,6 @@ app.post(
 async function startWhatsApp(
     forceRestart = false
 ) {
-
     if (
         botStarting &&
         !forceRestart
@@ -1614,7 +1110,6 @@ async function startWhatsApp(
         forceRestart &&
         sock
     ) {
-
         try {
             sock.end(
                 new Error(
@@ -1629,11 +1124,6 @@ async function startWhatsApp(
     botStarting = true;
 
     try {
-
-        /*
-           Ensure auth directory exists.
-        */
-
         fs.mkdirSync(
             AUTH_FOLDER,
             {
@@ -1649,16 +1139,9 @@ async function startWhatsApp(
                 AUTH_FOLDER
             );
 
-        /*
-           Always obtain the latest protocol
-           version supported by this Baileys
-           installation.
-        */
-
         let version;
 
         try {
-
             const latest =
                 await fetchLatestBaileysVersion();
 
@@ -1673,7 +1156,6 @@ async function startWhatsApp(
             );
 
         } catch (error) {
-
             logger.warn(
                 "Could not fetch latest WhatsApp version. Using Baileys default."
             );
@@ -1681,7 +1163,6 @@ async function startWhatsApp(
 
         sock =
             makeWASocket({
-
                 ...(version
                     ? { version }
                     : {}),
@@ -1713,31 +1194,20 @@ async function startWhatsApp(
                     false
             });
 
-        /*
-           Save credentials whenever
-           Baileys updates them.
-        */
-
         sock.ev.on(
             "creds.update",
             saveCreds
         );
 
-        /*
-           Connection updates.
-        */
-
         sock.ev.on(
             "connection.update",
             async update => {
-
                 const {
                     connection,
                     lastDisconnect
                 } = update;
 
                 if (connection) {
-
                     connectionState =
                         connection;
 
@@ -1749,15 +1219,10 @@ async function startWhatsApp(
                     );
                 }
 
-                /*
-                   Connected.
-                */
-
                 if (
                     connection ===
                     "open"
                 ) {
-
                     pairingInProgress =
                         false;
 
@@ -1775,15 +1240,10 @@ async function startWhatsApp(
                     );
                 }
 
-                /*
-                   Connection closed.
-                */
-
                 if (
                     connection ===
                     "close"
                 ) {
-
                     pairingInProgress =
                         false;
 
@@ -1808,11 +1268,8 @@ async function startWhatsApp(
                     if (
                         shouldReconnect
                     ) {
-
                         scheduleReconnect();
-
                     } else {
-
                         logger.error(
                             "WhatsApp logged out. Delete auth folder and pair again."
                         );
@@ -1824,16 +1281,10 @@ async function startWhatsApp(
             }
         );
 
-        /*
-           Incoming messages.
-        */
-
         sock.ev.on(
             "messages.upsert",
             async event => {
-
                 try {
-
                     if (
                         event.type !==
                         "notify"
@@ -1845,14 +1296,12 @@ async function startWhatsApp(
                         const message
                         of event.messages
                     ) {
-
                         await handleIncomingMessage(
                             message
                         );
                     }
 
                 } catch (error) {
-
                     logger.error(
                         {
                             error:
@@ -1865,7 +1314,6 @@ async function startWhatsApp(
         );
 
     } catch (error) {
-
         logger.error(
             {
                 error:
@@ -1878,7 +1326,6 @@ async function startWhatsApp(
             "error";
 
     } finally {
-
         botStarting =
             false;
     }
@@ -1889,7 +1336,6 @@ async function startWhatsApp(
 ========================================================= */
 
 function scheduleReconnect() {
-
     if (reconnectTimer) {
         return;
     }
@@ -1897,21 +1343,16 @@ function scheduleReconnect() {
     reconnectTimer =
         setTimeout(
             async () => {
-
                 reconnectTimer =
                     null;
 
                 try {
-
                     await startWhatsApp();
-
                 } catch (error) {
-
                     logger.error(
                         error
                     );
                 }
-
             },
             5000
         );
@@ -1924,7 +1365,6 @@ function scheduleReconnect() {
 async function handleIncomingMessage(
     message
 ) {
-
     if (!message) {
         return;
     }
@@ -1942,10 +1382,6 @@ async function handleIncomingMessage(
         return;
     }
 
-    /*
-       Ignore groups.
-    */
-
     if (
         remoteJid.endsWith(
             "@g.us"
@@ -1954,20 +1390,12 @@ async function handleIncomingMessage(
         return;
     }
 
-    /*
-       Ignore broadcasts/status.
-    */
-
     if (
         remoteJid ===
         "status@broadcast"
     ) {
         return;
     }
-
-    /*
-       Extract message text.
-    */
 
     const text =
         extractMessageText(
@@ -1983,10 +1411,6 @@ async function handleIncomingMessage(
             text
         );
 
-    /*
-       Not a MOCKRESULT command.
-    */
-
     if (!phone) {
         return;
     }
@@ -1996,7 +1420,6 @@ async function handleIncomingMessage(
     );
 
     try {
-
         await sock.sendMessage(
             remoteJid,
             {
@@ -2011,7 +1434,6 @@ async function handleIncomingMessage(
             );
 
         if (!submission) {
-
             await sock.sendMessage(
                 remoteJid,
                 {
@@ -2023,18 +1445,10 @@ async function handleIncomingMessage(
             return;
         }
 
-        /*
-           Generate or retrieve Reg Number.
-        */
-
         const regNumber =
             await ensureRegistrationNumber(
                 submission
             );
-
-        /*
-           Calculate subject scores.
-        */
 
         const scores =
             await calculateSubjectScores(
@@ -2068,7 +1482,6 @@ async function handleIncomingMessage(
         );
 
     } catch (error) {
-
         logger.error(
             {
                 error:
@@ -2095,7 +1508,6 @@ async function handleIncomingMessage(
 function extractMessageText(
     message
 ) {
-
     const msg =
         message.message;
 
@@ -2146,7 +1558,6 @@ function extractMessageText(
 app.get(
     "/health",
     (req, res) => {
-
         res.json({
             ok: true,
             service:
@@ -2155,7 +1566,6 @@ app.get(
             timestamp:
                 new Date().toISOString()
         });
-
     }
 );
 
@@ -2166,7 +1576,6 @@ app.get(
 app.listen(
     PORT,
     () => {
-
         console.log(
             `
 ========================================
@@ -2191,7 +1600,6 @@ MOCKRESULT08012345678
 ========================================
 `
         );
-
     }
 );
 
@@ -2199,23 +1607,12 @@ MOCKRESULT08012345678
    START WHATSAPP
 ========================================================= */
 
-/*
-   We start the WhatsApp socket on server
-   startup so an already-paired account can
-   reconnect automatically.
-
-   If no account has been paired yet,
-   the dashboard can initiate pairing.
-*/
-
 startWhatsApp()
     .catch(error => {
-
         console.error(
             "Initial WhatsApp startup failed:",
             error
         );
-
     });
 
 /* =========================================================
@@ -2225,13 +1622,11 @@ startWhatsApp()
 process.on(
     "SIGINT",
     async () => {
-
         logger.info(
             "Shutting down..."
         );
 
         try {
-
             if (sock) {
                 sock.end(
                     new Error(
@@ -2239,7 +1634,6 @@ process.on(
                     )
                 );
             }
-
         } catch (_) {}
 
         process.exit(0);
@@ -2249,13 +1643,11 @@ process.on(
 process.on(
     "SIGTERM",
     async () => {
-
         logger.info(
             "Shutting down..."
         );
 
         try {
-
             if (sock) {
                 sock.end(
                     new Error(
@@ -2263,7 +1655,6 @@ process.on(
                     )
                 );
             }
-
         } catch (_) {}
 
         process.exit(0);
