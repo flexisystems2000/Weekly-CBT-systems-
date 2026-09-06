@@ -1,15 +1,13 @@
 const express = require('express');
 const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason } = require('@whiskeysockets/baileys');
 const admin = require('firebase-admin');
-const pino = require('pino');
+const pino = pino = require('pino');
 const dotenv = require('dotenv');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 
 dotenv.config();
 
-// Initialize Firebase Admin SDK using FIREBASE_SERVICE_ACCOUNT env variable
 let firebaseApp = null;
 try {
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
@@ -17,7 +15,6 @@ try {
         try {
             serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
         } catch (e) {
-            // Handle escaped newlines or stringified json if needed
             serviceAccount = JSON.parse(Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT, 'base64').toString('utf8'));
         }
         firebaseApp = admin.initializeApp({
@@ -55,7 +52,6 @@ const subjectFileMap = {
     "Use of English": "12_Use_of_English_and_The_Lekki_Headmaster_Module_1-3.json"
 };
 
-// Global Baileys connection state trackers
 let sock = null;
 let connectionStateStatus = "Disconnected";
 let pairedWhatsAppNumber = "None";
@@ -63,7 +59,6 @@ let pairingStatus = "Idle";
 let currentPairingCode = null;
 let lastConnectionUpdate = "Never";
 
-// Cache for question bank files to avoid redundant network calls
 const questionCache = {};
 
 async function fetchSubjectQuestions(subjectName) {
@@ -76,7 +71,6 @@ async function fetchSubjectQuestions(subjectName) {
         const response = await fetch(url);
         if (!response.ok) return null;
         const data = await response.json();
-        // Take the first 15 questions per subject matching CBT logic
         const questions = Array.isArray(data) ? data.slice(0, 15) : (data.questions ? data.questions.slice(0, 15) : []);
         questionCache[subjectName] = questions;
         return questions;
@@ -95,14 +89,18 @@ function normalizePhoneNumber(rawNumber) {
 }
 
 function generateRegNumber() {
-    const digits = Math.floor(10000000000 + Math.random() * 90000000000).toString(); // 11 digits
+    const digits = Math.floor(10000000000 + Math.random() * 90000000000).toString();
     const letters = String.fromCharCode(65 + Math.floor(Math.random() * 26)) + 
-                    String.fromCharCode(65 + Math.floor(Math.random() * 26)); // 2 uppercase letters
+                    String.fromCharCode(65 + Math.floor(Math.random() * 26));
     return digits + letters;
 }
 
 async function startWhatsAppSession(targetPhoneNumber = null) {
     try {
+        if (!fs.existsSync(AUTH_FOLDER)) {
+            fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+        }
+
         const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
         const { version } = await fetchLatestBaileysVersion();
 
@@ -117,7 +115,7 @@ async function startWhatsAppSession(targetPhoneNumber = null) {
         sock.ev.on('creds.update', saveCreds);
 
         sock.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect, qr } = update;
+            const { connection, lastDisconnect } = update;
             lastConnectionUpdate = new Date().toISOString();
 
             if (connection) {
@@ -144,12 +142,10 @@ async function startWhatsAppSession(targetPhoneNumber = null) {
                 }
             }
 
-            // Handle pairing code request if target number is supplied and not registered
             if (targetPhoneNumber && !sock.authState.creds.registered) {
                 if (pairingStatus !== "Generating...") {
                     pairingStatus = "Generating...";
                     try {
-                        // Small delay to let socket initialize connection handshake
                         setTimeout(async () => {
                             try {
                                 const code = await sock.requestPairingCode(targetPhoneNumber);
@@ -173,7 +169,6 @@ async function startWhatsAppSession(targetPhoneNumber = null) {
                 if (!msg.message || msg.key.fromMe) continue;
 
                 const remoteJid = msg.key.remoteJid;
-                // Private chats only - ignore groups and statuses
                 if (!remoteJid || remoteJid.endsWith('@g.us') || remoteJid === 'status@broadcast' || remoteJid.includes('@broadcast')) {
                     continue;
                 }
@@ -206,19 +201,15 @@ async function handleResultRequest(remoteJid, phoneNumber, originalMsg) {
     }
 
     try {
-        // Query Firestore cbt_submissions collection
         const submissionsRef = db.collection('cbt_submissions');
         
-        // Try matching primary candidate.whatsapp field
         let snapshot = await submissionsRef.where('candidate.whatsapp', '==', phoneNumber).get();
         
-        // Fallback checks for alternative structures if empty
         if (snapshot.empty) {
             snapshot = await submissionsRef.where('candidateWhatsApp', '==', phoneNumber).get();
         }
 
         if (snapshot.empty) {
-            // Try matching local or international format variations
             const altPhone = phoneNumber.startsWith('234') ? phoneNumber.substring(3) : '234' + phoneNumber;
             snapshot = await submissionsRef.where('candidate.whatsapp', '==', altPhone).get();
         }
@@ -230,7 +221,6 @@ async function handleResultRequest(remoteJid, phoneNumber, originalMsg) {
             return;
         }
 
-        // Select the latest submission using submittedAt
         let docs = snapshot.docs.map(doc => ({ id: doc.id, ref: doc.ref, data: doc.data() }));
         docs.sort((a, b) => {
             const timeA = a.data.submittedAt?.toMillis ? a.data.submittedAt.toMillis() : (new Date(a.data.submittedAt || 0).getTime());
@@ -241,10 +231,8 @@ async function handleResultRequest(remoteJid, phoneNumber, originalMsg) {
         const latestDoc = docs[0];
         const submission = latestDoc.data;
 
-        // Check/Generate Registration Number
         let regNumber = submission.regNumber || submission.candidate?.regNumber;
         if (!regNumber || !/^\d{11}[A-Z]{2}$/.test(regNumber)) {
-            // Ensure uniqueness across Firestore
             let isUnique = false;
             while (!isUnique) {
                 regNumber = generateRegNumber();
@@ -253,7 +241,6 @@ async function handleResultRequest(remoteJid, phoneNumber, originalMsg) {
                     isUnique = true;
                 }
             }
-            // Save back to Firestore document
             await latestDoc.ref.update({ regNumber: regNumber });
         }
 
@@ -275,7 +262,7 @@ async function handleResultRequest(remoteJid, phoneNumber, originalMsg) {
                     const candidateAnswerIndex = answers[globalIndex] !== undefined ? answers[globalIndex] : answers[globalIndex.toString()];
                     
                     if (candidateAnswerIndex !== undefined && candidateAnswerIndex !== null) {
-                        const correctLetter = questions[qIdx].answer; // e.g. "A", "B", "C", "D"
+                        const correctLetter = questions[qIdx].answer;
                         const optionMapping = { 0: "A", 1: "B", 2: "C", 3: "D" };
                         const candidateLetter = optionMapping[candidateAnswerIndex];
                         
@@ -301,7 +288,6 @@ async function handleResultRequest(remoteJid, phoneNumber, originalMsg) {
     }
 }
 
-// Express Dashboard Routes
 app.get('/', (req, res) => {
     res.send(`
         <!DOCTYPE html>
@@ -461,6 +447,5 @@ app.get('/health', (req, res) => {
 
 app.listen(PORT, () => {
     console.log(`Flexi MockResult Bot server running on port ${PORT}`);
-    // Automatically start WhatsApp session on boot if credentials exist
     startWhatsAppSession();
 });
