@@ -3,1668 +3,1778 @@ require("dotenv").config();
 const express = require("express");
 const crypto = require("crypto");
 const fs = require("fs");
-const path = require("path");
 const pino = require("pino");
 
-const { initializeApp, cert } = require("firebase-admin/app");
-const { getFirestore, FieldPath, Timestamp } = require("firebase-admin/firestore");
-
 const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    DisconnectReason,
-    fetchLatestBaileysVersion,
-    makeCacheableSignalKeyStore,
-    Browsers
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+  Browsers,
 } = require("@whiskeysockets/baileys");
 
-/* =========================================================
-   CONFIGURATION
-========================================================= */
+const admin = require("firebase-admin");
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
 
 const PORT = process.env.PORT || 3000;
 
 const DASHBOARD_PASSWORD = "admin";
 
 const QUESTION_BANK_BASE_URL =
-    "https://raw.githubusercontent.com/flexisystems2000/Weekly-CBT-Mock-/main/questions";
+  "https://raw.githubusercontent.com/flexisystems2000/Weekly-CBT-Mock-/main/questions";
 
-const AUTH_FOLDER =
-    process.env.AUTH_FOLDER || "./auth_info_baileys";
-
-// Automatically clear the old auth folder on startup to fix session issues without shell access
-try {
-    fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
-    console.log("Cleared old auth folder successfully.");
-} catch (e) {
-    console.log("Auth folder not found or already clean.");
-}
-
-const LOG_LEVEL = "info";
+const AUTH_FOLDER = "./auth_info_baileys";
 
 const logger = pino({
-    level: LOG_LEVEL
+  level: process.env.LOG_LEVEL || "info",
 });
 
-/* =========================================================
-   FIREBASE
-========================================================= */
+// ============================================================
+// FIREBASE
+// ============================================================
 
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
-    console.error(
-        "ERROR: FIREBASE_SERVICE_ACCOUNT is missing from .env"
-    );
-    process.exit(1);
+  console.error("❌ FIREBASE_SERVICE_ACCOUNT is missing.");
+  process.exit(1);
 }
 
 let serviceAccount;
 
 try {
-    serviceAccount = JSON.parse(
-        process.env.FIREBASE_SERVICE_ACCOUNT
-    );
+  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 } catch (error) {
-    console.error(
-        "ERROR: FIREBASE_SERVICE_ACCOUNT is not valid JSON."
-    );
-    console.error(error.message);
-    process.exit(1);
+  console.error("❌ FIREBASE_SERVICE_ACCOUNT is not valid JSON.");
+  console.error(error.message);
+  process.exit(1);
 }
 
-initializeApp({
-    credential: cert(serviceAccount)
-});
+try {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+} catch (error) {
+  console.error("❌ Firebase initialization failed:");
+  console.error(error);
+  process.exit(1);
+}
 
-const db = getFirestore();
+const db = admin.firestore();
 
-/* =========================================================
-   QUESTION BANK MAP
-========================================================= */
-
-const subjectFileMap = {
-    "Mathematics":
-        "01_Mathematics_Module_1-3.json",
-
-    "Physics":
-        "02_Physics_Module_1-3.json",
-
-    "Chemistry":
-        "03_Chemistry_Module_1-3.json",
-
-    "Biology":
-        "04_Biology_Module_1-3.json",
-
-    "Commerce":
-        "05_Commerce_Module_1-3.json",
-
-    "Financial Accounting":
-        "06_Financial_Accounting_Module_1-3.json",
-
-    "Literature in English":
-        "07_Literature_in_English_Module_1-3.json",
-
-    "Government":
-        "08_Government_Module_1-3.json",
-
-    "Christian Religious Knowledge":
-        "09_Crk_Module_1-3.json",
-
-    "Economics":
-        "10_Economics_Module_1-3.json",
-
-    "Civic Education":
-        "11_Civic_Education_Module_1-3.json",
-
-    "Use of English":
-        "12_Use_of_English_and_The_Lekki_Headmaster_Module_1-3.json"
-};
-
-/* =========================================================
-   GLOBAL STATE
-========================================================= */
-
-let sock = null;
-
-let connectionState = "disconnected";
-
-let pairingInProgress = false;
-
-let currentPairingNumber = "";
-
-let pairingCode = "";
-
-let lastConnectionUpdate = null;
-
-let reconnectTimer = null;
-
-let botStarting = false;
-
-/* =========================================================
-   EXPRESS
-========================================================= */
+// ============================================================
+// EXPRESS
+// ============================================================
 
 const app = express();
 
 app.use(express.json());
 
-app.use(express.urlencoded({
-    extended: true
-}));
+app.use(express.urlencoded({ extended: true }));
 
-/* =========================================================
-   DASHBOARD AUTH
-========================================================= */
+// ============================================================
+// GLOBAL STATE
+// ============================================================
 
-function dashboardAuth(req, res, next) {
+let sock = null;
 
-    const password =
-        req.headers["x-dashboard-password"] ||
-        req.query.password ||
-        req.body?.password;
+let connectionState = "closed";
 
-    if (password !== DASHBOARD_PASSWORD) {
-        return res.status(401).json({
-            success: false,
-            message: "Unauthorized"
-        });
-    }
+let startingWhatsApp = false;
 
-    next();
+let reconnectTimer = null;
+
+let pairingInProgress = false;
+
+let pairingNumber = null;
+
+let latestPairingCode = null;
+
+let lastConnectionError = null;
+
+let connectedNumber = null;
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
-/* =========================================================
-   PHONE NUMBER HELPERS
-========================================================= */
 
 function normalizePhoneNumber(number) {
+  if (!number) return null;
 
-    if (!number) {
-        return "";
-    }
+  let value = String(number).replace(/\D/g, "");
 
-    let phone = String(number)
-        .trim()
-        .replace(/[^\d+]/g, "");
+  if (value.startsWith("234")) {
+    return value;
+  }
 
-    if (phone.startsWith("+")) {
-        phone = phone.substring(1);
-    }
+  if (value.startsWith("0")) {
+    return "234" + value.substring(1);
+  }
 
-    if (
-        phone.startsWith("0") &&
-        phone.length === 11
-    ) {
-        phone =
-            "234" +
-            phone.substring(1);
-    }
-
-    return phone;
+  return value;
 }
 
-function isValidWhatsAppNumber(number) {
+function formatPhoneNumber(number) {
+  const normalized = normalizePhoneNumber(number);
 
-    return /^\d{10,15}$/.test(number);
+  if (!normalized) return "";
+
+  if (normalized.startsWith("234") && normalized.length === 13) {
+    return "0" + normalized.substring(3);
+  }
+
+  return normalized;
 }
 
 function jidToPhone(jid) {
+  if (!jid) return null;
 
-    if (!jid) {
-        return "";
-    }
+  const value = String(jid).split(":")[0].split("@")[0];
 
-    return String(jid)
-        .split("@")[0]
-        .split(":")[0]
-        .replace(/\D/g, "");
+  return normalizePhoneNumber(value);
 }
-
-/* =========================================================
-   REGISTRATION NUMBER
-========================================================= */
 
 function generateRegistrationNumber() {
+  const number = Math.floor(
+    10000000000 + Math.random() * 90000000000
+  );
 
-    let digits = "";
+  const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
-    for (let i = 0; i < 11; i++) {
-        digits += crypto.randomInt(0, 10);
-    }
+  const first =
+    letters[Math.floor(Math.random() * letters.length)];
 
-    const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const second =
+    letters[Math.floor(Math.random() * letters.length)];
 
-    const first =
-        letters[
-            crypto.randomInt(
-                0,
-                letters.length
-            )
-        ];
-
-    const second =
-        letters[
-            crypto.randomInt(
-                0,
-                letters.length
-            )
-        ];
-
-    return digits + first + second;
+  return `${number}${first}${second}`;
 }
 
-function isValidRegistrationNumber(value) {
+function safeJsonParse(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
 
-    return (
-        typeof value === "string" &&
-        /^\d{11}[A-Z]{2}$/.test(value)
+// ============================================================
+// MESSAGE TEXT EXTRACTION
+// ============================================================
+
+function extractMessageText(message) {
+  if (!message) return "";
+
+  if (message.conversation) {
+    return message.conversation;
+  }
+
+  if (message.extendedTextMessage?.text) {
+    return message.extendedTextMessage.text;
+  }
+
+  if (message.imageMessage?.caption) {
+    return message.imageMessage.caption;
+  }
+
+  if (message.videoMessage?.caption) {
+    return message.videoMessage.caption;
+  }
+
+  return "";
+}
+
+// ============================================================
+// QUESTION BANK
+// ============================================================
+
+const SUBJECT_FILES = {
+  Mathematics: "01_Mathematics_Module_1-3.json",
+
+  Physics: "02_Physics_Module_1-3.json",
+
+  Chemistry: "03_Chemistry_Module_1-3.json",
+
+  Biology: "04_Biology_Module_1-3.json",
+
+  Commerce: "05_Commerce_Module_1-3.json",
+
+  "Financial Accounting":
+    "06_Financial_Accounting_Module_1-3.json",
+
+  "Literature in English":
+    "07_Literature_in_English_Module_1-3.json",
+
+  Government: "08_Government_Module_1-3.json",
+
+  "Christian Religious Knowledge":
+    "09_Crk_Module_1-3.json",
+
+  Economics: "10_Economics_Module_1-3.json",
+
+  "Civic Education":
+    "11_Civic_Education_Module_1-3.json",
+
+  "Use of English":
+    "12_Use_of_English_and_The_Lekki_Headmaster_Module_1-3.json",
+};
+
+async function fetchQuestionBank(subject) {
+  const filename = SUBJECT_FILES[subject];
+
+  if (!filename) {
+    throw new Error(`No question bank found for ${subject}`);
+  }
+
+  const url =
+    `${QUESTION_BANK_BASE_URL}/${encodeURIComponent(filename)}`;
+
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch ${subject} question bank: HTTP ${response.status}`
     );
+  }
+
+  const data = await response.json();
+
+  return data;
 }
 
-/* =========================================================
-   FIRESTORE REG NUMBER CHECK
-========================================================= */
+// ============================================================
+// QUESTION NORMALIZATION
+// ============================================================
 
-async function registrationNumberExists(regNumber) {
+function getQuestionArray(data) {
+  if (Array.isArray(data)) {
+    return data;
+  }
 
-    const snapshot =
-        await db
-            .collection("cbt_submissions")
-            .where(
-                "regNumber",
-                "==",
-                regNumber
-            )
-            .limit(1)
-            .get();
+  if (Array.isArray(data.questions)) {
+    return data.questions;
+  }
+
+  if (Array.isArray(data.data)) {
+    return data.data;
+  }
+
+  if (Array.isArray(data.items)) {
+    return data.items;
+  }
+
+  return [];
+}
+
+function getCorrectAnswer(question) {
+  if (!question) return "";
+
+  const answer =
+    question.answer ??
+    question.correctAnswer ??
+    question.correct_answer ??
+    question.correct ??
+    question.key;
+
+  if (typeof answer === "string") {
+    return answer.trim().toUpperCase().charAt(0);
+  }
+
+  return "";
+}
+
+function getQuestionId(question, index) {
+  if (!question) return String(index + 1);
+
+  return String(
+    question.id ??
+      question.questionId ??
+      question.number ??
+      index + 1
+  );
+}
+
+// ============================================================
+// RESULT LOOKUP
+// ============================================================
+
+async function findCandidateResult(phoneNumber) {
+  const normalized = normalizePhoneNumber(phoneNumber);
+
+  if (!normalized) {
+    return null;
+  }
+
+  const possibleNumbers = new Set();
+
+  possibleNumbers.add(normalized);
+
+  possibleNumbers.add("+" + normalized);
+
+  if (normalized.startsWith("234")) {
+    possibleNumbers.add("0" + normalized.substring(3));
+  }
+
+  for (const value of possibleNumbers) {
+    const snapshot = await db
+      .collection("cbt_submissions")
+      .where("candidate.whatsapp", "==", value)
+      .limit(10)
+      .get();
 
     if (!snapshot.empty) {
-        return true;
+      return snapshot.docs[0];
     }
+  }
 
-    const legacySnapshot =
-        await db
-            .collection("cbt_submissions")
-            .where(
-                "candidate.regNumber",
-                "==",
-                regNumber
-            )
-            .limit(1)
-            .get();
+  const snapshot2 = await db
+    .collection("cbt_submissions")
+    .where("candidateWhatsApp", "==", normalized)
+    .limit(10)
+    .get();
 
-    return !legacySnapshot.empty;
+  if (!snapshot2.empty) {
+    return snapshot2.docs[0];
+  }
+
+  return null;
 }
 
-/* =========================================================
-   ENSURE REGISTRATION NUMBER
-========================================================= */
+// ============================================================
+// REGISTRATION NUMBER
+// ============================================================
 
-async function ensureRegistrationNumber(
-    submissionDoc
-) {
+async function ensureRegistrationNumber(doc) {
+  const data = doc.data() || {};
 
-    const ref =
-        db
-            .collection("cbt_submissions")
-            .doc(submissionDoc.id);
+  let registrationNumber =
+    data.registrationNumber ||
+    data.candidate?.registrationNumber ||
+    data.regNo ||
+    data.regNumber;
 
-    const current =
-        submissionDoc.data();
+  if (registrationNumber) {
+    return registrationNumber;
+  }
+
+  registrationNumber = generateRegistrationNumber();
+
+  await doc.ref.update({
+    registrationNumber,
+  });
+
+  return registrationNumber;
+}
+
+// ============================================================
+// SCORING
+// ============================================================
+
+async function calculateSubjectScore(subject, answers) {
+  const bank = await fetchQuestionBank(subject);
+
+  const questions = getQuestionArray(bank).slice(0, 15);
+
+  let rawScore = 0;
+
+  const candidateAnswers =
+    answers?.[subject] ||
+    answers?.[subject.toLowerCase()] ||
+    {};
+
+  for (let index = 0; index < questions.length; index++) {
+    const question = questions[index];
+
+    const questionId = getQuestionId(question, index);
+
+    let candidateAnswer =
+      candidateAnswers[questionId];
 
     if (
-        isValidRegistrationNumber(
-            current.regNumber
-        )
+      candidateAnswer === undefined &&
+      Array.isArray(candidateAnswers)
     ) {
-        return current.regNumber;
+      candidateAnswer = candidateAnswers[index];
     }
 
     if (
-        isValidRegistrationNumber(
-            current.candidate?.regNumber
-        )
+      candidateAnswer === undefined &&
+      candidateAnswers[String(index + 1)] !== undefined
     ) {
-        return current.candidate.regNumber;
+      candidateAnswer =
+        candidateAnswers[String(index + 1)];
     }
 
-    let newRegNumber;
+    const correctAnswer =
+      getCorrectAnswer(question);
 
-    for (let attempt = 0; attempt < 20; attempt++) {
-
-        const candidate =
-            generateRegistrationNumber();
-
-        const exists =
-            await registrationNumberExists(
-                candidate
-            );
-
-        if (!exists) {
-            newRegNumber = candidate;
-            break;
-        }
+    if (!candidateAnswer) {
+      continue;
     }
 
-    if (!newRegNumber) {
-        throw new Error(
-            "Unable to generate a unique registration number."
+    const normalizedCandidate =
+      String(candidateAnswer)
+        .trim()
+        .toUpperCase()
+        .charAt(0);
+
+    if (
+      normalizedCandidate &&
+      normalizedCandidate === correctAnswer
+    ) {
+      rawScore++;
+    }
+  }
+
+  const score =
+    questions.length > 0
+      ? Math.round((rawScore / questions.length) * 100)
+      : 0;
+
+  return {
+    rawScore,
+    totalQuestions: questions.length,
+    score,
+  };
+}
+
+// ============================================================
+// EXTRACT ANSWERS
+// ============================================================
+
+function extractAnswers(data) {
+  return (
+    data.answers ||
+    data.candidate?.answers ||
+    data.responses ||
+    {}
+  );
+}
+
+// ============================================================
+// RESULT FORMATTER
+// ============================================================
+
+async function buildResultMessage(doc) {
+  const data = doc.data() || {};
+
+  const candidate =
+    data.candidate || {};
+
+  const name =
+    candidate.name ||
+    data.candidateName ||
+    data.name ||
+    "Candidate";
+
+  const whatsapp =
+    candidate.whatsapp ||
+    data.candidateWhatsApp ||
+    data.whatsapp ||
+    "";
+
+  const registrationNumber =
+    await ensureRegistrationNumber(doc);
+
+  const subjects =
+    candidate.subjects ||
+    data.subjects ||
+    [];
+
+  const answers = extractAnswers(data);
+
+  let resultLines = [];
+
+  let aggregate = 0;
+
+  let totalSubjects = 0;
+
+  for (const subject of subjects) {
+    if (!SUBJECT_FILES[subject]) {
+      continue;
+    }
+
+    try {
+      const result =
+        await calculateSubjectScore(
+          subject,
+          answers
         );
+
+      resultLines.push(
+        `📘 ${subject}: ${result.score}/100`
+      );
+
+      aggregate += result.score;
+
+      totalSubjects++;
+    } catch (error) {
+      console.error(
+        `Error scoring ${subject}:`,
+        error.message
+      );
+
+      resultLines.push(
+        `📘 ${subject}: Unable to calculate`
+      );
     }
+  }
 
-    await db.runTransaction(
-        async transaction => {
+  let average = 0;
 
-            const fresh =
-                await transaction.get(ref);
+  if (totalSubjects > 0) {
+    average = Math.round(
+      aggregate / totalSubjects
+    );
+  }
 
-            if (!fresh.exists) {
-                throw new Error(
-                    "Submission no longer exists."
-                );
-            }
+  const savedAggregate =
+    data.aggregateScore ??
+    data.totalScore ??
+    data.score;
 
-            const freshData =
-                fresh.data();
+  if (
+    resultLines.length === 0 &&
+    savedAggregate !== undefined
+  ) {
+    average = Number(savedAggregate) || 0;
+  }
 
-            if (
-                isValidRegistrationNumber(
-                    freshData.regNumber
-                )
-            ) {
-                newRegNumber =
-                    freshData.regNumber;
+  return `
+╭━━━━━━━━━━━━━━━━━━━━╮
+      📊 *MOCK CBT RESULT*
+╰━━━━━━━━━━━━━━━━━━━━╯
 
-                return;
-            }
+👤 *Candidate:* ${name}
 
-            transaction.update(
-                ref,
-                {
-                    regNumber: newRegNumber,
-                    regNumberCreatedAt:
-                        Timestamp.now()
-                }
-            );
-        }
+🆔 *Registration No:* ${registrationNumber}
+
+📱 *WhatsApp:* ${formatPhoneNumber(whatsapp)}
+
+━━━━━━━━━━━━━━━━━━━━
+
+${resultLines.join("\n")}
+
+━━━━━━━━━━━━━━━━━━━━
+
+🏆 *Overall Score:* ${average}/100
+
+📚 *Subjects:* ${totalSubjects}
+
+━━━━━━━━━━━━━━━━━━━━
+
+✅ Result successfully retrieved.
+
+_Flexi Educational Consult_
+`;
+}
+
+// ============================================================
+// WHATSAPP SOCKET
+// ============================================================
+
+async function createWhatsAppSocket() {
+  fs.mkdirSync(AUTH_FOLDER, {
+    recursive: true,
+  });
+
+  const {
+    state,
+    saveCreds,
+  } = await useMultiFileAuthState(
+    AUTH_FOLDER
+  );
+
+  let version;
+
+  try {
+    const latest =
+      await fetchLatestBaileysVersion();
+
+    version = latest.version;
+
+    console.log(
+      `Using Baileys version: ${version.join(".")}`
+    );
+  } catch (error) {
+    console.log(
+      "Could not fetch latest Baileys version. Using library default."
+    );
+  }
+
+  const socketOptions = {
+    ...(version ? { version } : {}),
+
+    auth: {
+      creds: state.creds,
+
+      keys: makeCacheableSignalKeyStore(
+        state.keys,
+        logger
+      ),
+    },
+
+    logger,
+
+    browser:
+      Browsers.appropriate("Chrome"),
+
+    markOnlineOnConnect: false,
+
+    syncFullHistory: false,
+
+    generateHighQualityLinkPreview: false,
+
+    keepAliveIntervalMs: 30000,
+
+    connectTimeoutMs: 60000,
+  };
+
+  const newSock =
+    makeWASocket(socketOptions);
+
+  newSock.ev.on(
+    "creds.update",
+    saveCreds
+  );
+
+  return newSock;
+}
+
+// ============================================================
+// START WHATSAPP
+// ============================================================
+
+async function startWhatsApp() {
+  if (startingWhatsApp) {
+    return;
+  }
+
+  if (
+    sock &&
+    connectionState === "open"
+  ) {
+    return;
+  }
+
+  startingWhatsApp = true;
+
+  try {
+    console.log(
+      "Starting WhatsApp connection..."
     );
 
-    return newRegNumber;
+    connectionState = "connecting";
+
+    const newSock =
+      await createWhatsAppSocket();
+
+    sock = newSock;
+
+    // --------------------------------------------------------
+    // CONNECTION UPDATE
+    // --------------------------------------------------------
+
+    sock.ev.on(
+      "connection.update",
+      async (update) => {
+        const {
+          connection,
+          lastDisconnect,
+        } = update;
+
+        if (connection === "open") {
+          connectionState = "open";
+
+          startingWhatsApp = false;
+
+          pairingInProgress = false;
+
+          pairingNumber = null;
+
+          latestPairingCode = null;
+
+          lastConnectionError = null;
+
+          connectedNumber =
+            jidToPhone(sock?.user?.id);
+
+          console.log(
+            "✅ WhatsApp connected successfully."
+          );
+
+          console.log(
+            "Connected number:",
+            connectedNumber
+              ? formatPhoneNumber(
+                  connectedNumber
+                )
+              : "Unknown"
+          );
+
+          return;
+        }
+
+        if (connection === "connecting") {
+          connectionState = "connecting";
+
+          console.log(
+            "🔄 WhatsApp connecting..."
+          );
+
+          return;
+        }
+
+        if (connection === "close") {
+          connectionState = "closed";
+
+          startingWhatsApp = false;
+
+          connectedNumber = null;
+
+          let statusCode = null;
+
+          try {
+            statusCode =
+              lastDisconnect
+                ?.error
+                ?.output
+                ?.statusCode;
+          } catch {}
+
+          const loggedOut =
+            statusCode ===
+            DisconnectReason.loggedOut;
+
+          lastConnectionError =
+            lastDisconnect?.error
+              ? String(
+                  lastDisconnect.error
+                )
+              : "Connection closed";
+
+          console.log(
+            "❌ WhatsApp connection closed."
+          );
+
+          console.log(
+            "Status code:",
+            statusCode
+          );
+
+          console.log(
+            "Logged out:",
+            loggedOut
+          );
+
+          if (loggedOut) {
+            console.log(
+              "⚠️ WhatsApp logged out. Auth was NOT automatically deleted."
+            );
+
+            pairingInProgress = false;
+
+            pairingNumber = null;
+
+            latestPairingCode = null;
+
+            return;
+          }
+
+          if (reconnectTimer) {
+            return;
+          }
+
+          reconnectTimer =
+            setTimeout(async () => {
+              reconnectTimer = null;
+
+              try {
+                await startWhatsApp();
+              } catch (error) {
+                console.error(
+                  "Reconnect failed:",
+                  error
+                );
+              }
+            }, 5000);
+        }
+      }
+    );
+
+    // --------------------------------------------------------
+    // MESSAGE HANDLER
+    // --------------------------------------------------------
+
+    sock.ev.on(
+      "messages.upsert",
+      async ({ messages }) => {
+        try {
+          for (const message of messages) {
+            await handleIncomingMessage(
+              message
+            );
+          }
+        } catch (error) {
+          console.error(
+            "Message handler error:",
+            error
+          );
+        }
+      }
+    );
+  } catch (error) {
+    startingWhatsApp = false;
+
+    connectionState = "closed";
+
+    lastConnectionError =
+      error?.message ||
+      String(error);
+
+    console.error(
+      "❌ Failed to start WhatsApp:",
+      error
+    );
+  }
 }
 
-/* =========================================================
-   DATE HELPERS
-========================================================= */
+// ============================================================
+// MESSAGE HANDLER
+// ============================================================
 
-function getTimestampMillis(value) {
-
-    if (!value) {
-        return 0;
-    }
-
-    if (
-        typeof value.toMillis === "function"
-    ) {
-        return value.toMillis();
-    }
-
-    if (
-        value instanceof Date
-    ) {
-        return value.getTime();
-    }
-
-    if (
-        typeof value === "number"
-    ) {
-        return value;
-    }
-
-    if (
-        typeof value === "string"
-    ) {
-        const parsed =
-            Date.parse(value);
-
-        return Number.isNaN(parsed)
-            ? 0
-            : parsed;
-    }
-
-    if (
-        typeof value === "object" &&
-        typeof value._seconds === "number"
-    ) {
-        return (
-            value._seconds * 1000 +
-            Math.floor(
-                (value._nanoseconds || 0) /
-                1000000
-            )
-        );
-    }
-
-    return 0;
-}
-
-/* =========================================================
-   PHONE VARIANTS
-========================================================= */
-
-function phoneVariants(phone) {
-
-    const normalized =
-        normalizePhoneNumber(phone);
-
-    const variants =
-        new Set();
-
-    if (!normalized) {
-        return [];
-    }
-
-    variants.add(normalized);
-
-    if (
-        normalized.startsWith("234") &&
-        normalized.length === 13
-    ) {
-        variants.add(
-            "0" +
-            normalized.substring(3)
-        );
-    }
-
-    return [...variants];
-}
-
-/* =========================================================
-   FIND CANDIDATE RESULT
-========================================================= */
-
-async function findCandidateResult(
-    phone
+async function handleIncomingMessage(
+  message
 ) {
+  if (!message) {
+    return;
+  }
 
-    const variants =
-        phoneVariants(phone);
+  if (message.key?.fromMe) {
+    return;
+  }
 
-    if (!variants.length) {
-        return null;
+  const remoteJid =
+    message.key?.remoteJid;
+
+  if (!remoteJid) {
+    return;
+  }
+
+  // Ignore groups
+  if (remoteJid.endsWith("@g.us")) {
+    return;
+  }
+
+  // Ignore status
+  if (
+    remoteJid ===
+    "status@broadcast"
+  ) {
+    return;
+  }
+
+  const text =
+    extractMessageText(
+      message.message
+    ).trim();
+
+  if (!text) {
+    return;
+  }
+
+  console.log(
+    `📩 Message from ${remoteJid}: ${text}`
+  );
+
+  // ----------------------------------------------------------
+  // RESULT COMMAND
+  // ----------------------------------------------------------
+
+  const resultMatch =
+    text.match(
+      /^MOCKRESULT\s*([0-9+ ]{10,20})$/i
+    );
+
+  if (!resultMatch) {
+    return;
+  }
+
+  const requestedNumber =
+    normalizePhoneNumber(
+      resultMatch[1]
+    );
+
+  if (!requestedNumber) {
+    await sendText(
+      remoteJid,
+      "❌ Please enter a valid Nigerian WhatsApp number."
+    );
+
+    return;
+  }
+
+  try {
+    await sendText(
+      remoteJid,
+      `🔎 Searching for your mock CBT result...\n\n📱 Number: ${formatPhoneNumber(
+        requestedNumber
+      )}`
+    );
+
+    const doc =
+      await findCandidateResult(
+        requestedNumber
+      );
+
+    if (!doc) {
+      await sendText(
+        remoteJid,
+        `
+❌ *RESULT NOT FOUND*
+
+We could not find a mock CBT result associated with:
+
+📱 ${formatPhoneNumber(
+          requestedNumber
+        )}
+
+Please make sure you entered the same WhatsApp number you used during registration.
+`
+      );
+
+      return;
     }
 
-    const results = [];
+    const resultMessage =
+      await buildResultMessage(doc);
 
-    const snapshot =
-        await db
-            .collection("cbt_submissions")
-            .where(
-                "candidate.whatsapp",
-                "in",
-                variants
-            )
-            .get();
+    await sendText(
+      remoteJid,
+      resultMessage
+    );
+  } catch (error) {
+    console.error(
+      "Result lookup error:",
+      error
+    );
 
-    snapshot.forEach(doc => {
+    await sendText(
+      remoteJid,
+      `
+❌ Sorry, an error occurred while retrieving your result.
 
-        results.push({
-            id: doc.id,
-            data: doc.data()
-        });
+Please try again shortly.
+`
+    );
+  }
+}
 
+// ============================================================
+// SEND MESSAGE
+// ============================================================
+
+async function sendText(
+  jid,
+  text
+) {
+  if (!sock) {
+    throw new Error(
+      "WhatsApp socket is not available."
+    );
+  }
+
+  return sock.sendMessage(
+    jid,
+    {
+      text,
+    }
+  );
+}
+
+// ============================================================
+// DASHBOARD AUTH
+// ============================================================
+
+function checkDashboardPassword(req, res) {
+  const password =
+    req.headers["x-dashboard-password"] ||
+    req.body?.password ||
+    req.query?.password;
+
+  if (
+    password !==
+    DASHBOARD_PASSWORD
+  ) {
+    res.status(401).json({
+      success: false,
+      error: "Invalid password",
     });
 
-    if (!results.length) {
+    return false;
+  }
 
-        for (const variant of variants) {
-
-            const fallback =
-                await db
-                    .collection(
-                        "cbt_submissions"
-                    )
-                    .where(
-                        "candidateWhatsApp",
-                        "==",
-                        variant
-                    )
-                    .get();
-
-            fallback.forEach(doc => {
-
-                results.push({
-                    id: doc.id,
-                    data: doc.data()
-                });
-
-            });
-        }
-    }
-
-    if (!results.length) {
-        return null;
-    }
-
-    results.sort(
-        (a, b) =>
-            getTimestampMillis(
-                b.data.submittedAt
-            ) -
-            getTimestampMillis(
-                a.data.submittedAt
-            )
-    );
-
-    return results[0];
+  return true;
 }
 
-/* =========================================================
-   FETCH QUESTION BANK
-========================================================= */
+// ============================================================
+// DASHBOARD
+// ============================================================
 
-async function fetchQuestionBank(
-    subject
-) {
-
-    const filename =
-        subjectFileMap[subject];
-
-    if (!filename) {
-        throw new Error(
-            `No question bank found for ${subject}`
-        );
-    }
-
-    const url =
-        `${QUESTION_BANK_BASE_URL}/${encodeURIComponent(filename)}`;
-
-    const response =
-        await fetch(url);
-
-    if (!response.ok) {
-        throw new Error(
-            `Unable to load ${subject} question bank. HTTP ${response.status}`
-        );
-    }
-
-    const data =
-        await response.json();
-
-    if (!Array.isArray(data)) {
-        throw new Error(
-            `${subject} question bank is not an array.`
-        );
-    }
-
-    return data.slice(0, 15);
-}
-
-/* =========================================================
-   ANSWER NORMALIZATION
-========================================================= */
-
-function normalizeAnswerIndex(value) {
-
-    if (
-        typeof value === "number" &&
-        Number.isInteger(value) &&
-        value >= 0 &&
-        value <= 3
-    ) {
-        return value;
-    }
-
-    if (
-        typeof value === "string"
-    ) {
-
-        const upper =
-            value.trim().toUpperCase();
-
-        if (
-            ["A", "B", "C", "D"]
-                .includes(upper)
-        ) {
-            return (
-                upper.charCodeAt(0) -
-                65
-            );
-        }
-
-        const number =
-            Number(value);
-
-        if (
-            Number.isInteger(number) &&
-            number >= 0 &&
-            number <= 3
-        ) {
-            return number;
-        }
-    }
-
-    return null;
-}
-
-/* =========================================================
-   SUBJECT SCORING
-========================================================= */
-
-async function calculateSubjectScores(
-    submission
-) {
-
-    const data =
-        submission.data;
-
-    const subjects =
-        Array.isArray(data.subjects)
-            ? data.subjects
-            : [];
-
-    const answers =
-        data.answers || {};
-
-    const subjectScores = [];
-
-    for (
-        let subjectIndex = 0;
-        subjectIndex < subjects.length;
-        subjectIndex++
-    ) {
-
-        const subject =
-            subjects[subjectIndex];
-
-        const questions =
-            await fetchQuestionBank(
-                subject
-            );
-
-        let rawScore = 0;
-
-        for (
-            let localIndex = 0;
-            localIndex < questions.length &&
-            localIndex < 15;
-            localIndex++
-        ) {
-
-            const question =
-                questions[localIndex];
-
-            const globalIndex =
-                subjectIndex * 15 +
-                localIndex;
-
-            let selected =
-                answers[globalIndex];
-
-            if (
-                selected === undefined ||
-                selected === null
-            ) {
-                selected =
-                    answers[
-                        String(globalIndex)
-                    ];
-            }
-
-            const selectedIndex =
-                normalizeAnswerIndex(
-                    selected
-                );
-
-            if (
-                selectedIndex === null
-            ) {
-                continue;
-            }
-
-            const correct =
-                String(
-                    question.answer || ""
-                )
-                    .trim()
-                    .toUpperCase();
-
-            const correctIndex =
-                correct.charCodeAt(0) -
-                65;
-
-            if (
-                selectedIndex ===
-                correctIndex
-            ) {
-                rawScore++;
-            }
-        }
-
-        const scoreOutOf100 =
-            Math.round(
-                (rawScore / 15) *
-                100
-            );
-
-        subjectScores.push({
-            subject,
-            rawScore,
-            totalQuestions: 15,
-            score: scoreOutOf100
-        });
-    }
-
-    const aggregate =
-        subjectScores.reduce(
-            (total, item) =>
-                total + item.score,
-            0
-        );
-
-    return {
-        subjectScores,
-        aggregate
-    };
-}
-
-/* =========================================================
-   RESULT MESSAGE
-========================================================= */
-
-function buildResultMessage({
-    name,
-    regNumber,
-    subjectScores,
-    aggregate
-}) {
-
-    let message =
-        `Dear ${name},\n\n` +
-        `Reg Number: ${regNumber}\n\n` +
-        `Your 2027 UTME Mock Result:\n\n`;
-
-    for (
-        const item of subjectScores
-    ) {
-
-        message +=
-            `${item.subject}: ${item.score}/100\n`;
-    }
-
-    message +=
-        `\nAggregate: ${aggregate}/400\n\n` +
-        `Thank you for participating in the Flexi Educational Consult Weekly CBT Mock.`;
-
-    return message;
-}
-
-/* =========================================================
-   MOCKRESULT COMMAND PARSER
-========================================================= */
-
-function parseMockResultCommand(
-    text
-) {
-
-    if (!text) {
-        return null;
-    }
-
-    const cleaned =
-        String(text)
-            .trim();
-
-    const match =
-        cleaned.match(
-            /^MOCKRESULT\s*[:\-]?\s*(\+?\d{10,15})$/i
-        );
-
-    if (!match) {
-        return null;
-    }
-
-    return normalizePhoneNumber(
-        match[1]
-    );
-}
-
-/* =========================================================
-   DASHBOARD HTML
-========================================================= */
-
-const dashboardHTML = `
+app.get("/", (req, res) => {
+  res.send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport"
+      content="width=device-width, initial-scale=1.0">
+
 <title>Flexi MockResult Bot</title>
+
 <style>
-* { box-sizing: border-box; }
-body { margin: 0; font-family: Arial, Helvetica, sans-serif; background: #07110d; color: #ffffff; }
-.container { width: 100%; max-width: 650px; margin: auto; padding: 20px; }
-.card { background: #0d1d17; border: 1px solid #1e3b2e; border-radius: 18px; padding: 22px; margin-top: 20px; box-shadow: 0 15px 40px rgba(0,0,0,.35); }
-h1 { margin-top: 0; color: #5ee59a; }
-h2 { margin-top: 0; }
-label { display: block; margin-bottom: 8px; font-weight: bold; }
-input { width: 100%; padding: 15px; border-radius: 10px; border: 1px solid #315642; background: #06100c; color: white; font-size: 16px; outline: none; }
-input:focus { border-color: #5ee59a; }
-button { width: 100%; padding: 15px; margin-top: 15px; border: none; border-radius: 10px; background: #159447; color: white; font-size: 16px; font-weight: bold; cursor: pointer; }
-button:hover { background: #1aad55; }
-.status { padding: 14px; border-radius: 10px; background: #06100c; margin-top: 15px; }
-.code { font-size: 32px; text-align: center; letter-spacing: 5px; font-weight: bold; color: #5ee59a; padding: 20px; background: #06100c; border-radius: 12px; margin-top: 15px; word-break: break-all; }
-.small { color: #9fb3a8; font-size: 14px; line-height: 1.5; }
-.hidden { display: none; }
-.error { color: #ff7777; }
-.success { color: #5ee59a; }
-.warning { color: #ffd166; }
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: Arial, sans-serif;
+  background: #07130e;
+  color: white;
+}
+
+.container {
+  max-width: 650px;
+  margin: auto;
+  padding: 20px;
+}
+
+.card {
+  background: #0d2118;
+  border: 1px solid #19452f;
+  border-radius: 18px;
+  padding: 22px;
+  margin-bottom: 20px;
+}
+
+h1 {
+  margin-top: 0;
+  color: #5cff9a;
+}
+
+h2 {
+  color: #8affb5;
+}
+
+input {
+  width: 100%;
+  padding: 14px;
+  margin: 8px 0;
+  border-radius: 10px;
+  border: 1px solid #286b49;
+  background: #07130e;
+  color: white;
+  font-size: 16px;
+}
+
+button {
+  width: 100%;
+  padding: 14px;
+  margin-top: 10px;
+  border: none;
+  border-radius: 10px;
+  background: #1ca55b;
+  color: white;
+  font-size: 16px;
+  font-weight: bold;
+}
+
+button:active {
+  transform: scale(.98);
+}
+
+.status {
+  padding: 14px;
+  border-radius: 10px;
+  background: #07130e;
+  margin-top: 10px;
+}
+
+.code {
+  font-size: 28px;
+  letter-spacing: 5px;
+  text-align: center;
+  padding: 20px;
+  background: #061b11;
+  border-radius: 12px;
+  color: #5cff9a;
+  font-weight: bold;
+  margin-top: 15px;
+}
+
+.small {
+  opacity: .7;
+  font-size: 13px;
+}
+
+pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 </style>
 </head>
+
 <body>
+
 <div class="container">
+
 <div class="card">
+
 <h1>Flexi MockResult Bot</h1>
-<p class="small">Pair your WhatsApp number with the bot using WhatsApp's pairing-code system.</p>
-<label>Dashboard Password</label>
-<input id="password" type="password" value="" placeholder="Enter dashboard password">
-<label style="margin-top:15px;">WhatsApp Number</label>
-<input id="phone" type="tel" placeholder="08012345678 or 2348012345678">
-<button onclick="pairBot()">GENERATE PAIRING CODE</button>
-<div id="message" class="status hidden"></div>
-<div id="codeBox" class="hidden">
-<h2>Pairing Code</h2>
-<div id="pairingCode" class="code"></div>
-<p class="small">Open WhatsApp on the phone you entered, go to Linked Devices → Link a Device → Link with phone number instead, then enter the code above.</p>
+
+<p>
+WhatsApp Mock CBT Result Bot
+</p>
+
+<div class="status">
+
+<strong>Status:</strong>
+
+<span id="status">
+Checking...
+</span>
+
 </div>
+
 </div>
+
+
 <div class="card">
-<h2>Bot Status</h2>
-<div class="status"><strong>Status:</strong> <span id="connection">Loading...</span></div>
-<div class="status"><strong>Paired Number:</strong> <span id="botNumber">-</span></div>
-<div class="status"><strong>Pairing:</strong> <span id="pairingStatus">-</span></div>
+
+<h2>Dashboard Login</h2>
+
+<input
+  id="password"
+  type="password"
+  placeholder="Dashboard password"
+/>
+
 </div>
+
+
 <div class="card">
-<h2>Command</h2>
-<p class="small">Students can send:</p>
-<div class="status">MOCKRESULT08012345678</div>
-<p class="small">or</p>
-<div class="status">MOCKRESULT 08012345678</div>
+
+<h2>Pair WhatsApp</h2>
+
+<input
+  id="phone"
+  placeholder="08012345678"
+  inputmode="numeric"
+/>
+
+<button onclick="pairWhatsApp()">
+Generate Pairing Code
+</button>
+
+<div
+  id="pairingCode"
+  class="code"
+  style="display:none"
+></div>
+
+<p class="small">
+Enter the Nigerian WhatsApp number you want to connect,
+then enter the generated pairing code inside WhatsApp.
+</p>
+
 </div>
-</div>
-<script>
-let password = "";
-function showMessage(text, type = "") {
-    const box = document.getElementById("message");
-    box.textContent = text;
-    box.className = "status " + type;
-}
-async function pairBot() {
-    password = document.getElementById("password").value;
-    const phone = document.getElementById("phone").value.trim();
-    if (!password) { showMessage("Enter dashboard password.", "error"); return; }
-    if (!phone) { showMessage("Enter the WhatsApp number.", "error"); return; }
-    showMessage("Requesting pairing code...", "warning");
-    try {
-        const response = await fetch("/api/pair", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "x-dashboard-password": password },
-            body: JSON.stringify({ phone })
-        });
-        const data = await response.json();
-        if (!response.ok) { throw new Error(data.message || "Pairing failed."); }
-        if (data.code) {
-            document.getElementById("pairingCode").textContent = data.code;
-            document.getElementById("codeBox").classList.remove("hidden");
-        }
-        showMessage(data.message || "Pairing code generated.", "success");
-        loadStatus();
-    } catch (error) {
-        showMessage(error.message, "error");
-    }
-}
-async function loadStatus() {
-    if (!password) { return; }
-    try {
-        const response = await fetch("/api/status", {
-            headers: { "x-dashboard-password": password }
-        });
-        if (!response.ok) { return; }
-        const data = await response.json();
-        document.getElementById("connection").textContent = data.connectionState;
-        document.getElementById("botNumber").textContent = data.phone || "-";
-        document.getElementById("pairingStatus").textContent = data.pairingInProgress ? "In progress" : "Not active";
-        if (data.pairingCode) {
-            document.getElementById("pairingCode").textContent = data.pairingCode;
-            document.getElementById("codeBox").classList.remove("hidden");
-        }
-    } catch (error) { console.error(error); }
-}
-document.getElementById("password").addEventListener("change", () => {
-    password = document.getElementById("password").value;
-    loadStatus();
-});
-setInterval(loadStatus, 5000);
-</script>
-</body>
-</html>
-`;
 
-/* =========================================================
-   DASHBOARD ROUTES
-========================================================= */
 
-app.get("/", (req, res) => {
-    res.send(dashboardHTML);
-});
+<div class="card">
 
-/* =========================================================
-   STATUS
-========================================================= */
+<h2>Result Command</h2>
 
-app.get(
-    "/api/status",
-    dashboardAuth,
-    (req, res) => {
-        res.json({
-            success: true,
-            connectionState,
-            phone:
-                currentPairingNumber ||
-                jidToPhone(
-                    sock?.user?.id
-                ),
-            pairingInProgress,
-            pairingCode,
-            lastConnectionUpdate
-        });
-    }
-);
-
-/* =========================================================
-   PAIRING
-========================================================= */
-
-app.post(
-    "/api/pair",
-    dashboardAuth,
-    async (req, res) => {
-        try {
-            let phone =
-                normalizePhoneNumber(
-                    req.body.phone
-                );
-
-            if (
-                !isValidWhatsAppNumber(
-                    phone
-                )
-            ) {
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Enter a valid WhatsApp number."
-                });
-            }
-
-            if (
-                pairingInProgress
-            ) {
-                return res.status(409).json({
-                    success: false,
-                    message:
-                        "A pairing request is already in progress."
-                });
-            }
-
-            currentPairingNumber =
-                phone;
-
-            pairingInProgress = true;
-
-            pairingCode = "";
-
-            await startWhatsApp(
-                true
-            );
-
-            let attempts = 0;
-
-            while (
-                attempts < 30
-            ) {
-                attempts++;
-
-                if (
-                    sock &&
-                    typeof sock.requestPairingCode ===
-                    "function"
-                ) {
-                    break;
-                }
-
-                await new Promise(
-                    resolve =>
-                        setTimeout(
-                            resolve,
-                            1000
-                        )
-                );
-            }
-
-            if (
-                !sock ||
-                typeof sock.requestPairingCode !==
-                "function"
-            ) {
-                pairingInProgress =
-                    false;
-
-                return res.status(500).json({
-                    success: false,
-                    message:
-                        "WhatsApp socket is not ready for pairing."
-                });
-            }
-
-            const code =
-                await sock.requestPairingCode(
-                    phone
-                );
-
-            pairingCode =
-                code;
-
-            return res.json({
-                success: true,
-                code,
-                phone,
-                message:
-                    "Pairing code generated successfully."
-            });
-
-        } catch (error) {
-            pairingInProgress =
-                false;
-
-            console.error(
-                "PAIRING ERROR:",
-                error
-            );
-
-            return res.status(500).json({
-                success: false,
-                message:
-                    error.message ||
-                    "Unable to generate pairing code."
-            });
-        }
-    }
-);
-
-/* =========================================================
-   WHATSAPP START
-========================================================= */
-
-async function startWhatsApp(
-    forceRestart = false
-) {
-    if (
-        botStarting &&
-        !forceRestart
-    ) {
-        return;
-    }
-
-    if (
-        forceRestart &&
-        sock
-    ) {
-        try {
-            sock.end(
-                new Error(
-                    "Restarting for new pairing."
-                )
-            );
-        } catch (_) {}
-
-        sock = null;
-    }
-
-    botStarting = true;
-
-    try {
-        fs.mkdirSync(
-            AUTH_FOLDER,
-            {
-                recursive: true
-            }
-        );
-
-        const {
-            state,
-            saveCreds
-        } =
-            await useMultiFileAuthState(
-                AUTH_FOLDER
-            );
-
-        let version;
-
-        try {
-            const latest =
-                await fetchLatestBaileysVersion();
-
-            version =
-                latest.version;
-
-            logger.info(
-                {
-                    version
-                },
-                "Using latest Baileys WhatsApp version"
-            );
-
-        } catch (error) {
-            logger.warn(
-                "Could not fetch latest WhatsApp version. Using Baileys default."
-            );
-        }
-
-        sock =
-            makeWASocket({
-                ...(version
-                    ? { version }
-                    : {}),
-
-                auth: {
-                    creds:
-                        state.creds,
-                    keys:
-                        makeCacheableSignalKeyStore(
-                            state.keys,
-                            logger
-                        )
-                },
-
-                logger,
-
-                browser:
-                    Browsers.appropriate(
-                        "Chrome"
-                    ),
-
-                markOnlineOnConnect:
-                    false,
-
-                syncFullHistory:
-                    false,
-
-                generateHighQualityLinkPreview:
-                    false
-            });
-
-        sock.ev.on(
-            "creds.update",
-            saveCreds
-        );
-
-        sock.ev.on(
-            "connection.update",
-            async update => {
-                const {
-                    connection,
-                    lastDisconnect
-                } = update;
-
-                if (connection) {
-                    connectionState =
-                        connection;
-
-                    lastConnectionUpdate =
-                        new Date().toISOString();
-
-                    logger.info(
-                        `WhatsApp connection: ${connection}`
-                    );
-                }
-
-                if (
-                    connection ===
-                    "open"
-                ) {
-                    pairingInProgress =
-                        false;
-
-                    pairingCode =
-                        "";
-
-                    currentPairingNumber =
-                        jidToPhone(
-                            sock?.user?.id
-                        ) ||
-                        currentPairingNumber;
-
-                    logger.info(
-                        `WhatsApp connected as ${currentPairingNumber}`
-                    );
-                }
-
-                if (
-                    connection ===
-                    "close"
-                ) {
-                    pairingInProgress =
-                        false;
-
-                    const statusCode =
-                        lastDisconnect
-                            ?.error
-                            ?.output
-                            ?.statusCode;
-
-                    const shouldReconnect =
-                        statusCode !==
-                        DisconnectReason.loggedOut;
-
-                    logger.warn(
-                        {
-                            statusCode,
-                            shouldReconnect
-                        },
-                        "WhatsApp connection closed"
-                    );
-
-                    if (
-                        shouldReconnect
-                    ) {
-                        scheduleReconnect();
-                    } else {
-                        logger.error(
-                            "WhatsApp logged out. Delete auth folder and pair again."
-                        );
-
-                        connectionState =
-                            "logged_out";
-                    }
-                }
-            }
-        );
-
-        sock.ev.on(
-            "messages.upsert",
-            async event => {
-                try {
-                    if (
-                        event.type !==
-                        "notify"
-                    ) {
-                        return;
-                    }
-
-                    for (
-                        const message
-                        of event.messages
-                    ) {
-                        await handleIncomingMessage(
-                            message
-                        );
-                    }
-
-                } catch (error) {
-                    logger.error(
-                        {
-                            error:
-                                error.message
-                        },
-                        "Message handler error"
-                    );
-                }
-            }
-        );
-
-    } catch (error) {
-        logger.error(
-            {
-                error:
-                    error.message
-            },
-            "WhatsApp startup error"
-        );
-
-        connectionState =
-            "error";
-
-    } finally {
-        botStarting =
-            false;
-    }
-}
-
-/* =========================================================
-   RECONNECT
-========================================================= */
-
-function scheduleReconnect() {
-    if (reconnectTimer) {
-        return;
-    }
-
-    reconnectTimer =
-        setTimeout(
-            async () => {
-                reconnectTimer =
-                    null;
-
-                try {
-                    await startWhatsApp();
-                } catch (error) {
-                    logger.error(
-                        error
-                    );
-                }
-            },
-            5000
-        );
-}
-
-/* =========================================================
-   MESSAGE HANDLER
-========================================================= */
-
-async function handleIncomingMessage(
-    message
-) {
-    if (!message) {
-        return;
-    }
-
-    if (
-        message.key.fromMe
-    ) {
-        return;
-    }
-
-    const remoteJid =
-        message.key.remoteJid;
-
-    if (!remoteJid) {
-        return;
-    }
-
-    if (
-        remoteJid.endsWith(
-            "@g.us"
-        )
-    ) {
-        return;
-    }
-
-    if (
-        remoteJid ===
-        "status@broadcast"
-    ) {
-        return;
-    }
-
-    const text =
-        extractMessageText(
-            message
-        );
-
-    if (!text) {
-        return;
-    }
-
-    const phone =
-        parseMockResultCommand(
-            text
-        );
-
-    if (!phone) {
-        return;
-    }
-
-    logger.info(
-        `Result request received for ${phone}`
-    );
-
-    try {
-        await sock.sendMessage(
-            remoteJid,
-            {
-                text:
-                    "🔎 Checking your mock result, please wait..."
-            }
-        );
-
-        const submission =
-            await findCandidateResult(
-                phone
-            );
-
-        if (!submission) {
-            await sock.sendMessage(
-                remoteJid,
-                {
-                    text:
-                        "❌ No mock result was found for this WhatsApp number.\n\nPlease make sure you entered the same number used during registration."
-                }
-            );
-
-            return;
-        }
-
-        const regNumber =
-            await ensureRegistrationNumber(
-                submission
-            );
-
-        const scores =
-            await calculateSubjectScores(
-                submission
-            );
-
-        const name =
-            submission.data
-                ?.candidate
-                ?.name ||
-            submission.data
-                ?.candidateName ||
-            "Candidate";
-
-        const resultMessage =
-            buildResultMessage({
-                name,
-                regNumber,
-                subjectScores:
-                    scores.subjectScores,
-                aggregate:
-                    scores.aggregate
-            });
-
-        await sock.sendMessage(
-            remoteJid,
-            {
-                text:
-                    resultMessage
-            }
-        );
-
-    } catch (error) {
-        logger.error(
-            {
-                error:
-                    error.message,
-                phone
-            },
-            "Result processing error"
-        );
-
-        await sock.sendMessage(
-            remoteJid,
-            {
-                text:
-                    "❌ Sorry, we could not process your result right now. Please try again later."
-            }
-        );
-    }
-}
-
-/* =========================================================
-   EXTRACT MESSAGE TEXT
-========================================================= */
-
-function extractMessageText(
-    message
-) {
-    const msg =
-        message.message;
-
-    if (!msg) {
-        return "";
-    }
-
-    if (
-        msg.conversation
-    ) {
-        return msg.conversation;
-    }
-
-    if (
-        msg.extendedTextMessage
-            ?.text
-    ) {
-        return (
-            msg.extendedTextMessage.text
-        );
-    }
-
-    if (
-        msg.imageMessage
-            ?.caption
-    ) {
-        return (
-            msg.imageMessage.caption
-        );
-    }
-
-    if (
-        msg.videoMessage
-            ?.caption
-    ) {
-        return (
-            msg.videoMessage.caption
-        );
-    }
-
-    return "";
-}
-
-/* =========================================================
-   HEALTH CHECK
-========================================================= */
-
-app.get(
-    "/health",
-    (req, res) => {
-        res.json({
-            ok: true,
-            service:
-                "Flexi MockResult Bot",
-            connectionState,
-            timestamp:
-                new Date().toISOString()
-        });
-    }
-);
-
-/* =========================================================
-   START SERVER
-========================================================= */
-
-app.listen(
-    PORT,
-    () => {
-        console.log(
-            `
-========================================
- FLEXI MOCKRESULT BOT
-========================================
-
-Dashboard:
-http://localhost:${PORT}
-
-Password:
-admin
-
-Question Bank:
-${QUESTION_BANK_BASE_URL}
-
-Firestore:
-cbt_submissions
-
-Result Command:
+<pre>
 MOCKRESULT08012345678
 
-========================================
-`
-        );
+or
+
+MOCKRESULT 08012345678
+</pre>
+
+<p class="small">
+Candidates should send the command to the bot in a private chat.
+</p>
+
+</div>
+
+</div>
+
+
+<script>
+
+async function getPassword() {
+  return document.getElementById(
+    "password"
+  ).value;
+}
+
+
+async function updateStatus() {
+
+  try {
+
+    const password =
+      await getPassword();
+
+    const response =
+      await fetch(
+        "/api/status?password=" +
+        encodeURIComponent(password)
+      );
+
+    const data =
+      await response.json();
+
+    const status =
+      document.getElementById(
+        "status"
+      );
+
+    if (!data.success) {
+      status.innerText =
+        "Enter dashboard password";
+
+      return;
     }
+
+    status.innerText =
+      data.connectionState +
+      (
+        data.connectedNumber
+          ? " — " +
+            data.connectedNumber
+          : ""
+      );
+
+  } catch (error) {
+
+    document.getElementById(
+      "status"
+    ).innerText =
+      "Server error";
+  }
+}
+
+
+async function pairWhatsApp() {
+
+  const password =
+    await getPassword();
+
+  const phone =
+    document.getElementById(
+      "phone"
+    ).value.trim();
+
+  if (!password) {
+    alert(
+      "Enter dashboard password."
+    );
+
+    return;
+  }
+
+  if (!phone) {
+    alert(
+      "Enter WhatsApp number."
+    );
+
+    return;
+  }
+
+  const response =
+    await fetch(
+      "/api/pair",
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body: JSON.stringify({
+          password,
+          phone
+        })
+      }
+    );
+
+  const data =
+    await response.json();
+
+  if (!data.success) {
+
+    alert(
+      data.error ||
+      "Pairing failed."
+    );
+
+    return;
+  }
+
+  const codeElement =
+    document.getElementById(
+      "pairingCode"
+    );
+
+  codeElement.style.display =
+    "block";
+
+  codeElement.innerText =
+    data.code ||
+    "Waiting...";
+
+  updateStatus();
+}
+
+
+setInterval(
+  updateStatus,
+  5000
 );
 
-/* =========================================================
-   START WHATSAPP
-========================================================= */
+updateStatus();
 
-startWhatsApp()
-    .catch(error => {
-        console.error(
-            "Initial WhatsApp startup failed:",
-            error
-        );
+</script>
+
+</body>
+</html>
+`);
+});
+
+// ============================================================
+// STATUS API
+// ============================================================
+
+app.get(
+  "/api/status",
+  (req, res) => {
+    if (!checkDashboardPassword(req, res)) {
+      return;
+    }
+
+    res.json({
+      success: true,
+
+      connectionState,
+
+      connected:
+        connectionState === "open",
+
+      connectedNumber:
+        connectedNumber
+          ? formatPhoneNumber(
+              connectedNumber
+            )
+          : null,
+
+      pairingInProgress,
+
+      pairingNumber:
+        pairingNumber
+          ? formatPhoneNumber(
+              pairingNumber
+            )
+          : null,
+
+      pairingCode:
+        latestPairingCode,
+
+      lastConnectionError,
     });
+  }
+);
 
-/* =========================================================
-   GRACEFUL SHUTDOWN
-========================================================= */
+// ============================================================
+// PAIRING API
+// ============================================================
 
-process.on(
-    "SIGINT",
-    async () => {
-        logger.info(
-            "Shutting down..."
+app.post(
+  "/api/pair",
+  async (req, res) => {
+    try {
+      const password =
+        req.body?.password;
+
+      if (
+        password !==
+        DASHBOARD_PASSWORD
+      ) {
+        return res.status(401).json({
+          success: false,
+          error: "Invalid password.",
+        });
+      }
+
+      const phone =
+        normalizePhoneNumber(
+          req.body?.phone
         );
 
+      if (!phone) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Enter a valid WhatsApp number.",
+        });
+      }
+
+      if (phone.length < 10) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Invalid WhatsApp number.",
+        });
+      }
+
+      // ------------------------------------------------------
+      // ALREADY CONNECTED
+      // ------------------------------------------------------
+
+      if (
+        sock &&
+        connectionState === "open"
+      ) {
+        if (
+          connectedNumber === phone
+        ) {
+          return res.json({
+            success: true,
+            alreadyConnected: true,
+            message:
+              "This WhatsApp number is already connected.",
+          });
+        }
+
+        return res.status(409).json({
+          success: false,
+          error:
+            "Another WhatsApp number is already connected. Log out that session before pairing a different number.",
+        });
+      }
+
+      // ------------------------------------------------------
+      // PREVENT DUPLICATE PAIRING
+      // ------------------------------------------------------
+
+      if (
+        pairingInProgress &&
+        pairingNumber === phone
+      ) {
+        return res.json({
+          success: true,
+          code:
+            latestPairingCode,
+          message:
+            "Pairing is already in progress.",
+        });
+      }
+
+      pairingInProgress = true;
+
+      pairingNumber = phone;
+
+      latestPairingCode = null;
+
+      // ------------------------------------------------------
+      // START SOCKET IF NEEDED
+      // ------------------------------------------------------
+
+      if (
+        !sock ||
+        connectionState === "closed"
+      ) {
+        await startWhatsApp();
+      }
+
+      // ------------------------------------------------------
+      // WAIT FOR SOCKET
+      // ------------------------------------------------------
+
+      const start =
+        Date.now();
+
+      let pairingCode = null;
+
+      while (
+        Date.now() - start <
+        30000
+      ) {
+        if (!sock) {
+          await sleep(500);
+
+          continue;
+        }
+
         try {
-            if (sock) {
-                sock.end(
-                    new Error(
-                        "Server shutting down"
-                    )
-                );
+          if (
+            typeof sock.requestPairingCode ===
+            "function"
+          ) {
+            pairingCode =
+              await sock.requestPairingCode(
+                phone
+              );
+
+            if (pairingCode) {
+              break;
             }
-        } catch (_) {}
+          }
+        } catch (error) {
+          lastConnectionError =
+            error?.message ||
+            String(error);
+
+          console.log(
+            "Pairing code request waiting:",
+            error?.message
+          );
+        }
+
+        await sleep(1000);
+      }
+
+      if (!pairingCode) {
+        pairingInProgress = false;
+
+        pairingNumber = null;
+
+        return res.status(500).json({
+          success: false,
+
+          error:
+            "Could not generate pairing code within 30 seconds. Check the server logs and try again.",
+        });
+      }
+
+      latestPairingCode =
+        pairingCode;
+
+      return res.json({
+        success: true,
+
+        code: pairingCode,
+
+        phone:
+          formatPhoneNumber(
+            phone
+          ),
+
+        message:
+          "Pairing code generated successfully.",
+      });
+    } catch (error) {
+      console.error(
+        "Pairing API error:",
+        error
+      );
+
+      pairingInProgress = false;
+
+      pairingNumber = null;
+
+      latestPairingCode = null;
+
+      return res.status(500).json({
+        success: false,
+
+        error:
+          error?.message ||
+          "Pairing failed.",
+      });
+    }
+  }
+);
+
+// ============================================================
+// HEALTH CHECK
+// ============================================================
+
+app.get(
+  "/health",
+  (req, res) => {
+    res.json({
+      status: "ok",
+
+      whatsapp:
+        connectionState,
+
+      connected:
+        connectionState === "open",
+
+      uptime:
+        process.uptime(),
+
+      timestamp:
+        new Date().toISOString(),
+    });
+  }
+);
+
+// ============================================================
+// 404
+// ============================================================
+
+app.use(
+  (req, res) => {
+    res.status(404).json({
+      success: false,
+      error: "Not found",
+    });
+  }
+);
+
+// ============================================================
+// SERVER START
+// ============================================================
+
+const server =
+  app.listen(
+    PORT,
+    () => {
+      console.log("");
+      console.log(
+        "========================================"
+      );
+      console.log(
+        "      FLEXI MOCKRESULT BOT"
+      );
+      console.log(
+        "========================================"
+      );
+      console.log(
+        `Dashboard: http://localhost:${PORT}`
+      );
+      console.log(
+        `Health:    http://localhost:${PORT}/health`
+      );
+      console.log(
+        "WhatsApp:  Starting..."
+      );
+      console.log(
+        "========================================"
+      );
+      console.log("");
+    }
+  );
+
+// ============================================================
+// START WHATSAPP AFTER SERVER
+// ============================================================
+
+startWhatsApp().catch(
+  (error) => {
+    console.error(
+      "Initial WhatsApp startup error:",
+      error
+    );
+  }
+);
+
+// ============================================================
+// GRACEFUL SHUTDOWN
+// ============================================================
+
+async function shutdown(
+  signal
+) {
+  console.log(
+    `\nReceived ${signal}. Shutting down...`
+  );
+
+  try {
+    if (reconnectTimer) {
+      clearTimeout(
+        reconnectTimer
+      );
+
+      reconnectTimer = null;
+    }
+
+    if (sock) {
+      try {
+        sock.end(
+          new Error(
+            "Server shutting down"
+          )
+        );
+      } catch {}
+    }
+
+    server.close(
+      () => {
+        console.log(
+          "HTTP server closed."
+        );
 
         process.exit(0);
-    }
+      }
+    );
+
+    setTimeout(() => {
+      process.exit(0);
+    }, 5000);
+  } catch (error) {
+    console.error(
+      "Shutdown error:",
+      error
+    );
+
+    process.exit(1);
+  }
+}
+
+process.on(
+  "SIGINT",
+  () => shutdown("SIGINT")
 );
 
 process.on(
-    "SIGTERM",
-    async () => {
-        logger.info(
-            "Shutting down..."
-        );
+  "SIGTERM",
+  () => shutdown("SIGTERM")
+);
 
-        try {
-            if (sock) {
-                sock.end(
-                    new Error(
-                        "Server shutting down"
-                    )
-                );
-            }
-        } catch (_) {}
+// ============================================================
+// PROCESS ERROR HANDLERS
+// ============================================================
 
-        process.exit(0);
-    }
+process.on(
+  "uncaughtException",
+  (error) => {
+    console.error(
+      "UNCAUGHT EXCEPTION:",
+      error
+    );
+  }
+);
+
+process.on(
+  "unhandledRejection",
+  (error) => {
+    console.error(
+      "UNHANDLED REJECTION:",
+      error
+    );
+  }
 );
