@@ -32,6 +32,14 @@ const QUESTION_BANK_BASE_URL =
 const AUTH_FOLDER =
     process.env.AUTH_FOLDER || "./auth_info_baileys";
 
+// Automatically clear the old auth folder on startup to fix session issues without shell access
+try {
+    fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+    console.log("Cleared old auth folder successfully.");
+} catch (e) {
+    console.log("Auth folder not found or already clean.");
+}
+
 const LOG_LEVEL = "info";
 
 const logger = pino({
